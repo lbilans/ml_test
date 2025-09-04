@@ -34,3 +34,48 @@ execute:
   error: false
 ---
 
+## Potrzebne biblioteki
+
+```{r}
+#| echo: false
+library(tidymodels)
+library(parsnip)
+library(dplyr)
+# Helper packages
+library(readr)# import danych
+library(broom.mixed) # konwersja 
+library(dotwhisker)  # wizualizacja
+library(GGally) # wizualizacja
+```
+
+## Wczytanie danych
+
+```{r}
+#| echo: false
+dane <- read_csv("kc_house_data.csv")
+```
+
+
+```{r}
+glimpse(dane)
+```
+```{r}
+#| echo: false
+set.seed(123)
+dane <- dane |> 
+  select(price, bedrooms, bathrooms, sqft_living, sqft_lot, floors, waterfront, view, condition, grade, sqft_above, sqft_basement, yr_built, yr_renovated, zipcode, lat, long, sqft_living15, sqft_lot15) |> 
+  mutate(waterfront = as.factor(waterfront),
+         view = as.factor(view),
+         condition = as.factor(condition),
+         grade = as.factor(grade),
+         zipcode = as.factor(zipcode))
+dane <- dane |> 
+  sample_n(1000)
+```
+
+```{r}
+summary(dane)
+```
+
+
+```{r}

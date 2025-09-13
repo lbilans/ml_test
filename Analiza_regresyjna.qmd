@@ -328,7 +328,148 @@ correlation_table
 
 
 ```
+## Podział danych na zbiory treningowy, walidacyjny i testowy
+```{r}
+#| echo: false
+house_split <- initial_validation_split(dane, 
+                            prop = c(0.6, 0.2),
+                            strata = price)
+
+house_train <- training(house_split) 
+house_val_adv <- validation(house_split)
+house_test  <- testing(house_split)
+
+house_vfold <- vfold_cv(house_train, 
+                       v = 10, 
+                       repeats = 5, 
+                       strata = price)
+
+  
+save(house_split, house_train, house_test, house_vfold,house_val_adv,
+    file = "data/house_data_splits.Rdata")
+```
+
+## Modelowanie  
+
+```{r}
+lm_spec <- 
+  linear_reg(penalty = tune(), mixture = tune()) |>
+  set_engine("glmnet") |>
+  set_mode("regression")
+
+rf_spec <- 
+  rand_forest(mtry = tune(), 
+              min_n = tune(), 
+              trees = 1000) |>
+  set_engine("ranger") |> 
+  set_mode("regression")
+
+xgb_spec <-
+  boost_tree(
+    tree_depth = tune(),
+    learn_rate = tune(),
+    loss_reduction = tune(),
+    min_n = tune(),
+    sample_size = tune(),
+    trees = 1000
+  ) |> 
+  set_engine("xgboost") |>
+  set_mode("regression")
+
+
+```
+
+### Modelowanie - formuła
 
 
 ```{r}
+minimal_recipe <- recipe(price ~ sqft_living + bedrooms + bathrooms + 
+                         grade + condition + waterfront + view + 
+                         built_ago, 
+                       data = house_train) %>%
+  
+  step_log(price, base = 10, offset = 1) %>%
+  step_log(sqft_living, base = 10, offset = 1) %>%
+  
+  step_dummy(all_nominal_predictors()) %>%
+  
+  step_normalize(all_numeric_predictors()) %>%
+  
+  step_zv(all_predictors())
 ```
+
+### Modelowanie - zaawansowane przetwarzanie danych
+```{r}
+advanced_recipe <- recipe(price ~ ., data = house_train) %>%
+
+  step_mutate(
+    has_basement = as.factor(ifelse(sqft_basement > 0, 1, 0)),
+    living_to_lot_ratio = sqft_living / (sqft_lot + 1),
+    is_renovated = as.factor(ifelse(renovated_ago < built_ago, 1, 0)),
+    total_rooms = bedrooms + bathrooms,
+    price_per_sqft = price / (sqft_living + 1)
+  ) %>%
+  
+  step_rm(sqft_basement, sqft_above) %>%
+  
+  step_other(view, threshold = 0.05) %>%
+  step_other(condition, threshold = 0.05) %>%
+  step_other(grade, threshold = 0.05) %>%
+  
+  step_interact(terms = ~ sqft_living:bedrooms) %>%
+  step_interact(terms = ~ bathrooms:bedrooms) %>%
+  
+  step_dummy(all_nominal_predictors(), one_hot = FALSE) %>%
+  
+  step_corr(all_numeric_predictors(), threshold = 0.9) %>%
+  
+  step_zv(all_predictors()) %>%
+  
+  step_normalize(all_numeric_predictors())
+
+
+
+
+```
+
+##### Modelowanie - drzewiaste modele
+
+```{r}
+tree_recipe <- recipe(price ~ ., data = house_train) %>%
+
+  step_log(price, base = 10, offset = 1) %>%
+  
+  step_mutate(
+    has_basement = as.factor(ifelse(sqft_basement > 0, 1, 0)),
+    is_renovated = as.factor(ifelse(renovated_ago < built_ago, 1, 0))
+  ) %>%
+  
+  step_rm(sqft_basement, sqft_above) %>%
+  
+  step_other(view, threshold = 0.03) %>%
+  step_other(condition, threshold = 0.03) %>%
+  
+  step_dummy(all_nominal_predictors(), one_hot = FALSE) %>%
+  
+  step_zv(all_predictors())
+```
+
+
+```{r}
+save(lm_spec, rf_spec, xgb_spec,
+     minimal_recipe, advanced_recipe, tree_recipe,
+     file = "data/house_modeling_objects.Rdata")
+
+prep(advanced_recipe, training = house_train) |> juice() 
+
+prep(minimal_recipe, training = house_train) |> juice()
+
+prep(tree_recipe, training = house_train) |> juice()
+
+summary(advanced_recipe) |> knitr::kable()
+
+summary(minimal_recipe) |> knitr::kable()
+
+summary(tree_recipe) |> knitr::kable()
+
+

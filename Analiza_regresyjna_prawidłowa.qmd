@@ -1,0 +1,956 @@
+---
+title: "Analiza regresyjna"
+author: "Łukasz Bilański"
+format: 
+  html:
+    self-contained: true
+    embed-resources: true
+    toc: true
+    toc-depth: 4
+    toc-location: right
+    toc-title: "Spis treści"
+    number-sections: true
+    number-depth: 4
+    code-fold: show
+    code-summary: "Show the code"
+    code-tools: true
+    code-block-bg: true
+    code-block-border-left: "black"
+    code-line-numbers: false
+    code-copy: true
+    html-math-method: katex
+    smooth-scroll: true
+    anchor-sections: true
+    link-external-icon: true
+    link-external-newwindow: true
+    theme:
+        light: cosmo
+        dark: darkly
+    fontsize: 1.0em
+    linestretch: 1.5
+execute:
+  warning: false
+  echo: true
+  error: false
+---
+
+## Potrzebne biblioteki
+
+```{r}
+#| echo: false
+#| 
+library(kknn)
+library(tidymodels)
+library(parsnip)
+library(dplyr)
+library(bonsai)
+library(lightgbm)
+library(readr)
+library(broom.mixed)
+library(dotwhisker)
+library(GGally)
+library(tidyverse)
+library(corrplot)
+library(openair)
+library(finetune)
+tidymodels_prefer()
+set.seed(123)
+```
+
+##  Funkcje pomocnicze
+```{r}
+diagnose_data <- function(data) {
+  cat("=== DIAGNOSTYKA DANYCH ===\n")
+  cat("Wymiary:", dim(data), "\n")
+  cat("Braki danych:\n")
+  missing <- data |> summarise_all(~sum(is.na(.))) |> 
+    pivot_longer(everything()) |> 
+    filter(value > 0)
+  if(nrow(missing) == 0) cat("Brak braków danych\n") else print(missing)
+}
+
+quality_control <- function(results) {
+  successful <- results |> 
+    filter(!map_lgl(result, ~inherits(.x, "try-error")))
+  failed <- results |> 
+    filter(map_lgl(result, ~inherits(.x, "try-error")))
+  
+  cat("Udane modele:", nrow(successful), "\n")
+  cat("Nieudane modele:", nrow(failed), "\n")
+  if(nrow(failed) > 0) {
+    cat("Nieudane:", paste(failed$wflow_id, collapse = ", "), "\n")
+  }
+}
+```
+
+
+## Wczytanie danych
+
+```{r}
+#| echo: false
+dane_raw <- read_csv("kc_house_data.csv")
+cat("Oryginalne dane:", dim(dane_raw), "\n")
+
+diagnose_data(dane_raw)
+```
+
+
+```{r}
+glimpse(dane)
+```
+
+
+```{r}
+#| echo: false
+set.seed(123)
+
+set.seed(123)
+
+dane <- dane_raw |>
+  drop_na() |>
+  select(price, bedrooms, bathrooms, sqft_living, sqft_lot, floors, 
+         waterfront, view, condition, grade, sqft_above, sqft_basement, 
+         yr_built, yr_renovated, sqft_living15, sqft_lot15) |>
+  mutate(
+    built_ago = 2015 - yr_built,
+    renovated_ago = ifelse(yr_renovated == 0, built_ago, 2015 - yr_renovated),
+  ) |>
+  select(-yr_built, -yr_renovated)
+
+cat("Unikalne wartości waterfront:", sort(unique(dane$waterfront)), "\n")
+cat("Unikalne wartości view:", sort(unique(dane$view)), "\n") 
+cat("Unikalne wartości condition:", sort(unique(dane$condition)), "\n")
+cat("Unikalne wartości grade:", sort(unique(dane$grade)), "\n")
+
+
+dane <- dane |>
+  mutate(
+    waterfront = factor(
+      case_when(
+        waterfront == 0 ~ "no",
+        waterfront == 1 ~ "yes",
+        TRUE ~ "no"
+      ),
+      levels = c("no", "yes")
+    ),
+    
+    view = factor(
+      case_when(
+        view == 0 ~ "none",
+        view %in% 1:2 ~ "fair",
+        view %in% 3:4 ~ "excellent",
+        TRUE ~ "none"
+      ),
+      levels = c("none", "fair", "excellent")
+    ),
+    
+    condition = factor(
+      case_when(
+        condition <= 2 ~ "poor", 
+        condition == 3 ~ "average",
+        condition >= 4 ~ "good",
+        TRUE ~ "average"
+      ),
+      levels = c("poor", "average", "good")
+    ),
+    
+    grade = factor(
+      case_when(
+        grade <= 6 ~ "low",
+        grade %in% 7:8 ~ "average",
+        grade %in% 9:10 ~ "good",
+        grade %in% 11:12 ~ "high", 
+        grade >= 13 ~ "luxury",
+        TRUE ~ "average"
+      ),
+      levels = c("low", "average", "good", "high", "luxury")
+    )
+  )
+
+cat("Po przetworzeniu:", dim(dane), "\n")
+cat("Poziomy faktorów:\n")
+cat("waterfront:", levels(dane$waterfront), "\n")
+cat("view:", levels(dane$view), "\n") 
+cat("condition:", levels(dane$condition), "\n")
+cat("grade:", levels(dane$grade), "\n")
+diagnose_data(dane)
+```
+
+```{r}
+summary(dane)
+```
+## Eksploracyjna analiza danych
+
+### Wizualizacja zmiennych
+
+```{r}
+#| echo: false
+library(patchwork)
+
+p1 <- ggplot(dane, aes(x = price)) +
+  geom_histogram(bins = 30, fill = "steelblue", alpha = 0.7) +
+  labs(title = "Rozkład cen domów", x = "Cena [USD]", y = "Liczba") +
+  scale_x_continuous(labels = scales::comma) +
+  coord_cartesian(xlim = c(0, 2500000))
+
+p2 <- ggplot(dane, aes(x = sqft_living)) +
+  geom_histogram(bins = 30, fill = "coral", alpha = 0.7) +
+  labs(title = "Rozkład powierzchni mieszkalnej", x = "Powierzchnia (sqft)", y = "Liczba")
+
+p3 <- ggplot(dane, aes(x = sqft_lot)) +
+  geom_histogram(bins = 30, fill = "green", alpha = 0.7) +
+  labs(title = "Rozkład powierzchni działki", 
+       x = "Powierzchnia działki (sqft, log scale)", 
+       y = "Liczba") +
+  scale_x_log10(labels = scales::comma) +
+  theme_minimal()
+
+p4 <- ggplot(dane, aes(x = built_ago)) +
+  geom_histogram(bins = 30, fill = "purple", alpha = 0.7) +
+  labs(title = "Rozkład wieku budynków", x = "Wiek (lata)", y = "Liczba")
+
+
+p1
+
+(p1 + p2) / (p3 + p4)
+
+
+p5 <- ggplot(dane, aes(x = bathrooms)) +
+  geom_histogram(bins = 20, fill = "orange", alpha = 0.7) +
+  labs(title = "Rozkład liczby łazienek", x = "Liczba łazienek", y = "Liczba")
+
+p6 <- ggplot(dane, aes(x = bedrooms)) +
+  geom_histogram(bins = 15, fill = "pink", alpha = 0.7) +
+  labs(title = "Rozkład liczby sypialni", x = "Liczba sypialni", y = "Liczba")
+
+p7 <- ggplot(dane, aes(x = floors)) +
+  geom_histogram(bins = 10, fill = "brown", alpha = 0.7) +
+  labs(title = "Rozkład liczby pięter", x = "Liczba pięter", y = "Liczba")
+
+p8 <- ggplot(dane, aes(x = renovated_ago)) +
+  geom_histogram(bins = 30, fill = "gray", alpha = 0.7) +
+  labs(title = "Rozkład czasu od renowacji", x = "Lata od renowacji", y = "Liczba")
+
+(p5 + p6) / (p7 + p8)
+```
+
+
+```{r}
+
+p9 <- ggplot(dane, aes(x = waterfront)) +
+  geom_bar(fill = "blue", alpha = 0.7) +
+  labs(title = "Dostęp do waterfront", x = "Waterfront", y = "Liczba")
+
+p10 <- ggplot(dane, aes(x = view)) +
+  geom_bar(fill = "red", alpha = 0.7) +
+  labs(title = "Rodzaj widoku", x = "Ocena widoku", y = "Liczba")
+
+p11 <- ggplot(dane, aes(x = condition)) +
+  geom_bar(fill = "green", alpha = 0.7) +
+  labs(title = "Stan techniczny", x = "Ocena stanu", y = "Liczba")
+
+p12 <- ggplot(dane, aes(x = grade)) +
+  geom_bar(fill = "purple", alpha = 0.7) +
+  labs(title = "Ogólna ocena", x = "Ocena ogólna", y = "Liczba")
+
+(p9 + p10) / (p11 + p12)
+```
+
+
+```{r}
+#| echo: false
+
+p13 <- ggplot(dane, aes(x = sqft_above)) +
+  geom_histogram(bins = 30, fill = "darkblue", alpha = 0.7) +
+  labs(title = "Powierzchnia nadziemna", x = "Sqft above", y = "Liczba")
+
+p14 <- ggplot(dane, aes(x = sqft_basement)) +
+  geom_histogram(bins = 30, fill = "darkgreen", alpha = 0.7) +
+  labs(title = "Powierzchnia piwnicy", x = "Sqft basement", y = "Liczba")
+
+p15 <- ggplot(dane, aes(x = sqft_living15)) +
+  geom_histogram(bins = 30, fill = "darkred", alpha = 0.7) +
+  labs(title = "Pow. mieszkalna sąsiedztwa", x = "Sqft living (sąsiedztwo)", y = "Liczba")
+
+p16 <- ggplot(dane, aes(x = sqft_lot15)) +
+  geom_histogram(bins = 30, fill = "darkorange", alpha = 0.7) +
+  labs(title = "Pow. działki sąsiedztwa", x = "Sqft lot (sąsiedztwo)", y = "Liczba") +
+  scale_x_continuous(labels = scales::comma)
+
+(p13 + p14) / (p15 + p16)
+```
+
+
+### Wykresy pudełkowe zmiennych numerycznych
+
+```{r}
+boxplots <- dane |> 
+  select(where(is.numeric))  |> 
+  pivot_longer(everything(), names_to = "variable", values_to = "value") |> 
+  ggplot(aes(x = variable, y = value)) +
+  geom_boxplot(fill = "blue", outlier.color = "red", outlier.alpha = 0.7) +
+  coord_flip() + 
+  labs(title = "Wykresy pudełkowe zmiennych numerycznych (w oryginalnej skali)",
+       x = "",
+       y = "Wartość") +
+  theme_minimal()
+boxplots
+
+
+boxplots_log <- dane |> 
+  select(where(is.numeric)) |> 
+  mutate(across(everything(), ~ log10(.x + 1))) |> 
+  pivot_longer(everything(), names_to = "variable", values_to = "value") |> 
+  ggplot(aes(x = variable, y = value)) +
+  geom_boxplot(fill = "lightgreen", outlier.color = "red", outlier.alpha = 0.7) +
+  coord_flip() +
+  labs(title = "Wykresy pudełkowe zmiennych numerycznych (skala log10)",
+       x = "",
+       y = "log10(Wartość)") +
+  theme_minimal()
+
+
+boxplots + boxplots_log
+
+p1 <- ggplot(dane, aes(x = "", y = price)) +
+  geom_boxplot(fill = "salmon", outlier.color = "red") +
+  labs(title = "Boxplot dla Ceny (price)", x = "") +
+  scale_y_continuous(labels = scales::comma)
+ p1
+```
+
+### Korelacje między zmiennymi
+
+```{r}
+#| echo: false
+glimpse(dane)
+```
+
+
+```{r}
+# #| echo: false
+# 
+# dane_numeric <- dane |>
+#   select(where(is.numeric))
+# ggpairs(dane_numeric)
+```
+
+
+```{r}
+#| echo: false
+library(corrplot)
+
+numeric_data <- dane |>  select(where(is.numeric))
+cor_matrix <- cor(numeric_data, use = "complete.obs")
+
+price_cor <- cor_matrix["price", ]
+strong_cor_vars <- names(which(abs(price_cor) > 0.3 & names(price_cor) != "price"))
+
+filtered_cor <- cor_matrix[c("price", strong_cor_vars), c("price", strong_cor_vars)]
+
+corrplot(filtered_cor, method = "color", type = "upper", 
+         order = "hclust", tl.col = "black", tl.srt = 45,
+         addCoef.col = "black", number.cex = 0.7,
+         title = "Korelacje ze zmienną price (|r| > 0.3)",
+         mar = c(0,0,1,0))
+```
+```{r}
+#| echo: false
+correlations <- as.data.frame(cor_matrix) |> 
+  tibble::rownames_to_column("variable") |> 
+  select(variable, price) |> 
+  filter(variable != "price") |> 
+  arrange(desc(abs(price)))
+
+ggplot(correlations, aes(x = reorder(variable, price), y = price, fill = price)) +
+  geom_bar(stat = "identity") +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white", 
+                       midpoint = 0, name = "Korelacja") +
+  coord_flip() +
+  theme_minimal() +
+  labs(title = "Korelacja zmiennych z ceną domów",
+       x = "Zmienna",
+       y = "Współczynnik korelacji z ceną") +
+  geom_text(aes(label = round(price, 2), 
+                hjust = ifelse(price > 0, -0.1, 1.1)), 
+            size = 3) +
+  ylim(min(correlations$price) - 0.1, max(correlations$price) + 0.1)
+```
+```{r}
+library(dplyr)
+library(knitr)
+
+correlation_table <- correlations|> 
+  mutate(Correlation = round(price, 3),
+         Strength = case_when(
+           abs(price) >= 0.7 ~ "Bardzo silna",
+           abs(price) >= 0.5 ~ "Silna", 
+           abs(price) >= 0.3 ~ "Umiarkowana",
+           abs(price) >= 0.2 ~ "Słaba",
+           TRUE ~ "Bardzo słaba"
+         ),
+         Direction = ifelse(price > 0, "Dodatnia", "Ujemna")) |> 
+  select(Variable = variable, Correlation, Strength, Direction )|>
+  arrange(desc(abs(Correlation)))
+kable(correlation_table, caption = "Ranking korelacji zmiennych z ceną")
+
+correlation_table
+
+
+```
+## Podział danych na zbiory treningowy, walidacyjny i testowy
+```{r}
+#| echo: false
+house_split <- initial_validation_split(dane, 
+                            prop = c(0.6, 0.2),
+                            strata = price)
+
+house_train <- training(house_split) 
+house_val_adv <- validation(house_split)
+house_test  <- testing(house_split)
+
+house_vfold <- vfold_cv(house_train, 
+                       v = 5, 
+                       repeats = 2, 
+                       strata = price)
+
+cat("Rozmiary zbiorów:\n")
+cat("Treningowy:", nrow(house_train), "\n")
+cat("Walidacyjny:", nrow(house_val_adv), "\n")
+cat("Testowy:", nrow(house_test), "\n")
+
+cat("=== WERYFIKACJA POZIOMÓW PO PODZIALE ===\n")
+
+check_factor_consistency <- function(train_data, val_data, test_data) {
+  factor_vars <- names(train_data)[sapply(train_data, is.factor)]
+  
+  for(var in factor_vars) {
+    train_levels <- levels(train_data[[var]])
+    val_levels <- levels(val_data[[var]])
+    test_levels <- levels(test_data[[var]])
+    
+    cat("Zmienna:", var, "\n")
+    cat("  Train:", paste(train_levels, collapse = ", "), "\n")
+    cat("  Val:  ", paste(val_levels, collapse = ", "), "\n") 
+    cat("  Test: ", paste(test_levels, collapse = ", "), "\n")
+    
+    if(identical(train_levels, val_levels) && identical(val_levels, test_levels)) {
+      cat("  Status: ✅ ZGODNE\n")
+    } else {
+      cat("  Status: ❌ NIEZGODNE!\n")
+    }
+    cat("\n")
+  }
+}
+
+check_factor_consistency(house_train, house_val_adv, house_test)
+
+cat("Rozmiary zbiorów:\n")
+cat("Treningowy:", nrow(house_train), "\n")
+cat("Walidacyjny:", nrow(house_val_adv), "\n") 
+cat("Testowy:", nrow(house_test), "\n")
+
+
+  
+save(house_split, house_train, house_test, house_vfold,house_val_adv,
+    file = "data/house_data_splits.Rdata")
+```
+
+## Modelowanie  
+
+```{r}
+library(rules)
+
+lm_spec <- linear_reg(penalty = tune(), mixture = tune()) |>
+  set_engine("glmnet") |> set_mode("regression")
+
+rf_spec <- rand_forest(mtry = tune(),
+                       min_n = tune(),
+                       trees = tune()) |>
+  set_engine("ranger") |> set_mode("regression")
+
+xgb_spec <- boost_tree(
+  tree_depth = tune(),
+  learn_rate = tune(),
+  loss_reduction = tune(),
+  min_n = tune(),
+  sample_size = tune(),
+  trees = tune()
+) |> set_engine("xgboost") |> set_mode("regression")
+
+cubist_spec <- cubist_rules(
+  committees = tune(),
+  neighbors = tune()
+) |> set_engine("Cubist") |> set_mode("regression")
+
+lightgbm_spec <- boost_tree(
+  tree_depth = tune(),
+  learn_rate = tune(),
+  min_n = tune(),
+  trees = tune()
+) |> set_engine("lightgbm") |> set_mode("regression")
+
+knn_spec <- nearest_neighbor(
+  neighbors = tune(),
+  weight_func = tune()
+) |> set_engine("kknn") |> set_mode("regression")
+
+svm_spec <- svm_rbf(
+  cost = tune(),
+  rbf_sigma = tune(),
+  margin = tune()
+) |> set_engine("kernlab") |> set_mode("regression")
+
+nnet_spec <- mlp(
+  hidden_units = tune(),
+  penalty = tune(),
+  epochs = tune()
+) |> set_engine("nnet") |> set_mode("regression")
+
+lm_params <- extract_parameter_set_dials(lm_spec) |>
+  update(
+    penalty = penalty(c(-3, 0)),
+    mixture = mixture(c(0.2, 0.8))
+  )
+
+
+rf_params <- extract_parameter_set_dials(rf_spec) |>
+  update(
+    min_n = min_n(c(8, 14)),
+    mtry = mtry(c(3, 8)),
+    trees = trees(c(200, 500))
+  )
+
+xgb_params <- extract_parameter_set_dials(xgb_spec) |>
+  update(
+    min_n = min_n(c(8, 14)),
+    trees = trees(c(200, 400)),
+    tree_depth = tree_depth(c(6, 10)),
+    learn_rate = learn_rate(c(-1.5, -0.8)),
+  )
+    
+lm_params <- extract_parameter_set_dials(lm_spec) |>
+  update(
+    penalty = penalty(c(-3, 0)),
+    mixture = mixture(c(0.2, 0.8))
+  )
+
+cubist_params <- extract_parameter_set_dials(cubist_spec) |>
+  update(
+    committees = committees(c(10, 50)),
+    neighbors = neighbors(c(3, 7))
+  )
+
+lightgbm_params <- extract_parameter_set_dials(lightgbm_spec) |>
+  update(
+    min_n = min_n(c(8, 14)),
+    trees = trees(c(200, 400)),
+    tree_depth = tree_depth(c(6, 10)),
+    learn_rate = learn_rate(c(-1.5, -0.8))
+  )
+  
+knn_spec_params <- extract_parameter_set_dials(knn_spec) |>
+  update(
+    neighbors = neighbors(c(5, 20)),
+    weight_func = weight_func(values = c("rectangular", "triangular", "epanechnikov"))
+  )
+
+svm_params <- extract_parameter_set_dials(svm_spec) |>
+  update(
+    cost = cost(c(-2, 2)),
+    rbf_sigma = rbf_sigma(c(-2, 1)),
+  )
+
+nnet_params <- extract_parameter_set_dials(nnet_spec) |>
+  update(
+    hidden_units = hidden_units(c(5, 20)),
+    penalty = penalty(c(-3, 0)),
+    epochs = epochs(c(100, 500))
+  )
+```
+ Modelowanie - formuła
+
+
+```{r}
+basic_rec <- recipe(price ~ ., data = house_train) |>
+  step_novel(all_nominal_predictors()) |> 
+  step_dummy(all_nominal_predictors()) |>
+  step_zv(all_predictors()) |>
+  step_normalize(all_numeric_predictors())
+
+```
+
+### Przepis basic uproszczony
+
+```{r}
+# advanced_recipe <- recipe(price ~ ., data = house_train) |>
+#   step_rm(sqft_lot, sqft_lot15, renovated_ago) |>
+#   step_novel(all_nominal_predictors()) |> 
+#   step_dummy(all_nominal_predictors()) |>
+#   step_zv(all_predictors()) |>
+#   step_normalize(all_numeric_predictors())
+```
+
+### Modelowanie - zaawansowane przetwarzanie danych
+```{r}
+# 
+# advanced_recipe <- recipe(price ~ ., data = house_train) |>
+#   step_novel(all_nominal_predictors()) |>  
+#   step_mutate(
+#     has_basement = as.factor(ifelse(sqft_basement > 0, "yes", "no")),
+#     living_to_lot_ratio = sqft_living / (sqft_lot + 1),
+#     is_renovated = as.factor(ifelse(renovated_ago < built_ago, "yes", "no")),
+#     total_rooms = bedrooms + bathrooms
+#   ) |>
+#   step_rm(sqft_basement, sqft_above) |>
+#   step_other(view, threshold = 0.05) |>
+#   step_other(condition, threshold = 0.05) |>
+#   step_other(grade, threshold = 0.05) |>
+#   step_interact(terms = ~ sqft_living:bedrooms) |>
+#   step_interact(terms = ~ bathrooms:bedrooms) |>
+#   step_dummy(all_nominal_predictors(), one_hot = FALSE) |>
+#   step_zv(all_predictors()) |>
+#   step_corr(all_numeric_predictors(), threshold = 0.9) |>
+#   step_normalize(all_numeric_predictors())
+
+```
+
+##### Modelowanie - drzewiaste modele
+
+```{r}
+tree_recipe <- recipe(price ~ ., data = house_train) |>
+  step_novel(all_nominal_predictors()) |> 
+  step_mutate(
+    has_basement = as.factor(ifelse(sqft_basement > 0, "yes", "no")),
+    is_renovated = as.factor(ifelse(renovated_ago < built_ago, "yes", "no"))
+  ) |>
+  step_rm(sqft_basement, sqft_above) |>
+  step_other(view, threshold = 0.03) |>
+  step_other(condition, threshold = 0.03) |>
+  step_dummy(all_nominal_predictors(), one_hot = FALSE) |>
+  step_zv(all_predictors()) |> 
+  step_corr(all_numeric_predictors(), threshold = 0.9) |>
+  step_normalize(all_numeric_predictors())
+
+```
+
+### Testowanie receptur
+```{r}
+cat("=== TEST RECEPTUR ===\n")
+tryCatch({
+  prep(basic_rec, training = house_train) |> juice() |> glimpse()
+  cat("✅ basic_rec OK\n")
+}, error = function(e) cat("❌ basic_rec błąd:", e$message, "\n"))
+
+# tryCatch({
+#   prep(advanced_recipe, training = house_train) |> juice() |> glimpse() 
+#   cat("✅ advanced_recipe OK\n")
+# }, error = function(e) cat("❌ advanced_recipe błąd:", e$message, "\n"))
+
+tryCatch({
+  prep(tree_recipe, training = house_train) |> juice() |> glimpse()
+  cat("✅ tree_recipe OK\n") 
+}, error = function(e) cat("❌ tree_recipe błąd:", e$message, "\n"))
+```
+
+### Zapisanie obiektów modelowania
+```{r}
+save(lm_spec, rf_spec, xgb_spec,
+     basic_rec, tree_recipe,
+     file = "data/house_modeling_objects.Rdata")
+
+# prep(advanced_recipe, training = house_train) |> juice() 
+
+prep(basic_rec, training = house_train) |> juice()
+
+prep(tree_recipe, training = house_train) |> juice()
+
+# summary(advanced_recipe) |> knitr::kable()
+
+summary(basic_rec) |> knitr::kable()
+
+summary(tree_recipe) |> knitr::kable()
+
+```
+# Test pojedynczego modelu bez tuningu
+
+```{r}
+# # Wybierz najlepszy model z poprzednich wyników (XGBoost)
+# quick_xgb_spec <- boost_tree(
+#   tree_depth = 8,      # Stała wartość z dobrych wyników
+#   learn_rate = 0.1,    # Stała wartość
+#   trees = 300,      # Stała wartość - bez tuningu
+#   min_n = 8          # Stała wartość
+# )  |> 
+#   set_engine("xgboost") |>
+#   set_mode("regression")
+# 
+# # Prosta receptura - bez skomplikowanego feature engineering
+# quick_recipe <- recipe(price ~ ., data = house_train) |>
+#   step_dummy(all_nominal_predictors()) |>
+#   step_zv(all_predictors()) |>
+#   step_normalize(all_numeric_predictors())
+# 
+# # Jeden workflow
+# quick_workflow <- workflow() |>
+#   add_recipe(tree_recipe) |>
+#   add_model(quick_xgb_spec)
+# 
+# # Szybkie dopasowanie bez tuningu
+# cat("=== SZYBKI TEST POJEDYNCZEGO MODELU ===\n")
+# start_time <- Sys.time()
+# 
+# quick_fit <- fit(quick_workflow, data = house_train)
+# 
+# # Predykcje na zbiorze testowym
+# quick_predictions <- predict(quick_fit, new_data = house_test) |>
+#   bind_cols(house_test |> select(price))
+# 
+# # Metryki
+# quick_metrics <- metric_set(rmse, rsq, mae)(
+#   quick_predictions, 
+#   truth = price, 
+#   estimate = .pred
+# )
+# 
+# end_time <- Sys.time()
+# cat("Czas obliczenia:", difftime(end_time, start_time, units = "secs"), "sekund\n")
+# 
+# print("Wyniki szybkiego modelu:")
+# print(quick_metrics)
+# 
+# # Prosty wykres
+# quick_predictions |>
+#   ggplot(aes(price, .pred)) +
+#   geom_point(alpha = 0.6) +
+#   geom_abline(slope = 1, color = "red") +
+#   labs(title = "Szybki XGBoost - Predykcje vs Rzeczywiste",
+#        x = "Rzeczywista cena", y = "Przewidziana cena") +
+#   scale_x_continuous(labels = scales::comma) +
+#   scale_y_continuous(labels = scales::comma)
+# 
+# # Proste wnioski
+# avg_price <- mean(house_test$price)
+# rmse_val <- quick_metrics |> filter(.metric == "rmse") |> pull(.estimate)
+# r2_val <- quick_metrics |> filter(.metric == "rsq") |> pull(.estimate)
+# 
+# cat("\n=== SZYBKA OCENA BIZNESOWA ===\n")
+# cat("RMSE:", scales::comma(round(rmse_val)), "USD\n")
+# cat("R²:", round(r2_val, 3), "\n")
+# cat("RMSE jako % średniej ceny:", round(rmse_val/avg_price*100, 1), "%\n")
+# cat("Model", ifelse(r2_val > 0.65, "akceptowalny", "wymaga poprawy"), "dla projektu\n")
+```
+
+### Strojenie hiperparametrów wielu modeli i receptur
+
+```{r}
+#| echo: true
+  library(rules)
+required_packages <- c("glmnet", "ranger", "xgboost", "Cubist", "rpart", "finetune", "doParallel","workflowsets")
+sapply(required_packages, require, character.only = TRUE)
+
+load("data/house_data_splits.Rdata")
+load("data/house_modeling_objects.Rdata")
+
+# set.seed(111)
+# all_workflows <- workflow_set(
+#   preproc = list(
+#     basic = basic_rec,
+#     # advanced = advanced_recipe,
+#     tree = tree_recipe
+#   ),
+#   models = list(
+#     glmnet = lm_spec,
+#     ranger = rf_spec,
+#     xgboost = xgb_spec,
+#     cubist = cubist_spec,
+#     lightgbm = lightgbm_spec,
+#     nnet = nnet_spec,
+#     svm = svm_spec,
+#     kknn = knn_spec
+#   ))
+# 
+# print(all_workflows)
+# 
+# set.seed(123)
+# 
+# 
+# race_ctrl <- control_race(
+#   save_pred = TRUE,
+#   parallel_over = "everything",
+#   save_workflow = FALSE
+# )
+# start_time <- Sys.time()
+# cat("Rozpoczęcie strojenia w:", format(start_time, "%H:%M:%S"), "\n")
+# tuned_results <- all_workflows |>
+#   workflow_map(
+#     "tune_race_anova",      
+#     seed = 1503,
+#     resamples = house_vfold,
+#     grid = 50,             
+#     control = race_ctrl,
+#     verbose = TRUE,
+#     metrics = metric_set(rmse, mae, rsq)
+#   )
+# end_time <- Sys.time()
+# 
+# cat("Tuning zakończony w:", difftime(end_time, start_time, units = "mins"), "min\n")
+
+load("data/house_tuned_results.Rdata")
+
+quality_control(tuned_results)
+
+
+model_rankings <- rank_results(tuned_results, rank_metric = "rmse", select_best = TRUE)
+print(model_rankings)
+
+model_rankings
+
+if(exists("test_metrics")) {
+  avg_price <- mean(house_test$price)
+  best_rmse <- test_metrics |> filter(.metric == "rmse") |> pull(.estimate)
+  best_r2 <- test_metrics |> filter(.metric == "rsq") |> pull(.estimate)
+
+  cat("=== WNIOSKI BIZNESOWE ===\n")
+  cat("Najlepszy model:", best_model_id, "\n")
+  cat("RMSE:", scales::comma(round(best_rmse)), "USD\n")
+  cat("R²:", round(best_r2, 3), "\n")
+  cat("RMSE jako % średniej ceny:", round(best_rmse/avg_price*100, 1), "%\n")
+  cat("Liczba domów w analizie:", scales::comma(nrow(dane)), "\n")
+  cat("Model nadaje się do", 
+      ifelse(best_rmse/avg_price < 0.1, "precyzyjnych", "szacunkowych"), 
+      "wycen nieruchomości\n")
+}
+
+```
+```{r}
+cat("=== POZIOMY CZYNNIKÓW W ZBIORZE TRENINGOWYM ===\n")
+sapply(house_train |> select(where(is.factor)), levels)
+
+cat("=== POZIOMY CZYNNIKÓW W ZBIORZE WALIDACYJNYM ===\n")
+sapply(house_val_adv |> select(where(is.factor)), levels)
+
+cat("=== POZIOMY CZYNNIKÓW W ZBIORZE TESTOWYM ===\n")
+sapply(house_test |> select(where(is.factor)), levels)
+```
+
+### Modelowanie - wybór najlepszego modelu i ocena na zbiorze walidacyjnym i testowym
+```{r}
+
+# save(tuned_results, file = "data/house_tuned_results.Rdata")
+load("data/house_tuned_results.Rdata")
+
+model_rankings <- rank_results(tuned_results, rank_metric = "rmse", select_best = TRUE)
+print(model_rankings)
+
+
+autoplot(tuned_results, metric = "rmse") +
+  theme_minimal() +
+  labs(title = "Porównanie modeli według RMSE")
+
+
+if(nrow(model_rankings) > 0) {
+  best_model_id <- model_rankings$wflow_id[1]
+  best_result <- tuned_results |>
+    extract_workflow_set_result(best_model_id)
+  
+  best_params <- select_best(best_result, metric = "rmse")
+  print(best_params)
+  
+
+  final_workflow <- tuned_results |>
+    extract_workflow(best_model_id) |>
+    finalize_workflow(best_params)
+  
+
+  final_fit <- fit(final_workflow, data = house_train)
+  
+
+  save(final_fit, file = "data/house_final_model.Rdata")
+  
+  val_predictions <- predict(final_fit, new_data = house_val_adv) |>
+    bind_cols(house_val_adv |> select(price))
+  
+  val_metrics <- metric_set(rmse, rsq, mae)(val_predictions, truth = price, estimate = .pred)
+  print("Wyniki na zbiorze walidacyjnym:")
+  print(val_metrics)
+  
+
+  test_predictions <- predict(final_fit, new_data = house_test) |>
+    bind_cols(house_test |> select(price))
+  
+  test_metrics <- metric_set(rmse, rsq, mae)(test_predictions, truth = price, estimate = .pred)
+  print("Ostateczne wyniki na zbiorze testowym:")
+  print(test_metrics)
+  
+}
+
+```
+
+# Wykresy podsumowujące
+
+## Prosty wykres predykcji vs rzeczywiste
+
+```{r}
+best_predictions <- test_predictions
+
+rmse_val <- test_metrics |> filter(.metric == "rmse") |> pull(.estimate)
+rsq_val <- test_metrics |> filter(.metric == "rsq") |> pull(.estimate)
+
+ggplot(best_predictions, aes(x = price, y = .pred)) +
+  geom_point(alpha = 0.6, color = "steelblue") +
+  geom_abline(slope = 1, intercept = 0, color = "red", linewidth = 1) +
+  geom_smooth(method = "lm", color = "darkgreen", se = FALSE) +
+  labs(title = "Predykcje vs Rzeczywiste wartości - Najlepszy model",
+       subtitle = paste("RMSE:", scales::comma(round(rmse_val)), 
+                       "USD | R²:", round(rsq_val, 3)),
+       x = "Rzeczywista cena (USD)", 
+       y = "Przewidziana cena (USD)") +
+  scale_x_continuous(labels = scales::comma) +
+  scale_y_continuous(labels = scales::comma) +
+  theme_minimal()
+```
+
+
+
+### Wykresy reszt
+```{r}
+best_predictions <- best_predictions |>
+  mutate(residuals = price - .pred,
+         residual_pct = residuals / price * 100)
+
+p1 <- ggplot(best_predictions, aes(x = .pred, y = residuals)) +
+  geom_point(alpha = 0.6, color = "coral") +
+  geom_hline(yintercept = 0, color = "red", linetype = "dashed") +
+  geom_smooth(color = "blue", se = FALSE) +
+  labs(title = "Rozkład reszt modelu",
+       subtitle = "Idealnie: rozkład losowy wokół zera",
+       x = "Przewidziana cena", y = "Residua (rzeczywista - przewidziana)") +
+  theme_minimal()
+
+p2 <- ggplot(best_predictions, aes(x = residual_pct)) +
+  geom_histogram(bins = 30, fill = "lightblue", alpha = 0.7) +
+  geom_vline(xintercept = 0, color = "red", linetype = "dashed") +
+  labs(title = "Rozkład błędów procentowych",
+       subtitle = paste("Średni błąd:", round(mean(abs(best_predictions$residual_pct)), 1), "%"),
+       x = "Błąd procentowy (%)", y = "Liczba obserwacji") +
+  theme_minimal()
+
+p1 + p2
+```
+
+### Wykres feature importance
+```{r}
+library(vip)
+
+if(grepl("xgb|lightgbm", best_model_id)) {
+  final_fit |> 
+    extract_fit_parsnip() |> 
+    vip(geom = "col", num_features = 10) +
+    labs(title = "Najważniejsze cechy w predykcji cen domów",
+         subtitle = "Analiza feature importance - XGBoost/LightGBM",
+         y = "Znaczenie zmiennej") +
+    theme_minimal()
+}
+```
+
